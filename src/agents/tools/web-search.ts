@@ -1,3 +1,4 @@
+import { execSync } from "child_process";
 import { Type } from "@sinclair/typebox";
 import { formatCliCommand } from "../../cli/command-format.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -20,7 +21,7 @@ import {
   writeCache,
 } from "./web-shared.js";
 
-const SEARCH_PROVIDERS = ["brave", "perplexity", "grok", "gemini", "kimi"] as const;
+const SEARCH_PROVIDERS = ["baidu", "brave", "perplexity", "grok", "gemini", "kimi"] as const;
 const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
 
@@ -348,49 +349,17 @@ function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDE
   if (raw === "brave") {
     return "brave";
   }
+  if (raw === "baidu") {
+    return "baidu";
+  }
 
   // Auto-detect provider from available API keys (priority order)
   if (raw === "") {
-    // 1. Brave
-    if (resolveSearchApiKey(search)) {
-      defaultRuntime.log(
-        'web_search: no provider configured, auto-detected "brave" from available API keys',
-      );
-      return "brave";
-    }
-    // 2. Gemini
-    const geminiConfig = resolveGeminiConfig(search);
-    if (resolveGeminiApiKey(geminiConfig)) {
-      defaultRuntime.log(
-        'web_search: no provider configured, auto-detected "gemini" from available API keys',
-      );
-      return "gemini";
-    }
-    // 3. Kimi
-    const kimiConfig = resolveKimiConfig(search);
-    if (resolveKimiApiKey(kimiConfig)) {
-      defaultRuntime.log(
-        'web_search: no provider configured, auto-detected "kimi" from available API keys',
-      );
-      return "kimi";
-    }
-    // 4. Perplexity
-    const perplexityConfig = resolvePerplexityConfig(search);
-    const { apiKey: perplexityKey } = resolvePerplexityApiKey(perplexityConfig);
-    if (perplexityKey) {
-      defaultRuntime.log(
-        'web_search: no provider configured, auto-detected "perplexity" from available API keys',
-      );
-      return "perplexity";
-    }
-    // 5. Grok
-    const grokConfig = resolveGrokConfig(search);
-    if (resolveGrokApiKey(grokConfig)) {
-      defaultRuntime.log(
-        'web_search: no provider configured, auto-detected "grok" from available API keys',
-      );
-      return "grok";
-    }
+    // Default to baidu (no API key required)
+    defaultRuntime.log(
+      'web_search: no provider configured, defaulting to "baidu" (no API key required)',
+    );
+    return "baidu";
   }
 
   return "brave";
@@ -935,6 +904,46 @@ function buildKimiToolResultContent(data: KimiSearchResponse): string {
   });
 }
 
+async function runBaiduSearch(params: {
+  query: string;
+  count: number;
+  timeoutSeconds: number;
+}): Promise<{
+  results: Array<{ title: string; url: string; description: string; siteName?: string }>;
+}> {
+  const scriptPath = "/opt/openclaw/src/agents/tools/baidu/baidu_search.py";
+
+  const cmd = `python3 "${scriptPath}" "${params.query.replace(/"/g, '\\"')}" --num ${params.count} --output json`;
+
+  try {
+    const output = execSync(cmd, {
+      encoding: "utf-8",
+      timeout: params.timeoutSeconds * 1000,
+    });
+
+    const jsonMatch = output.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error("无法解析百度搜索结果");
+    }
+
+    const data = JSON.parse(jsonMatch[0]) as {
+      web?: { results?: Array<{ title?: string; url?: string; abstract?: string }> };
+    };
+    const results = (data.web?.results ?? []).map((entry) => ({
+      title: entry.title ?? "",
+      url: entry.url ?? "",
+      description: entry.abstract ?? "",
+      siteName: entry.url ? new URL(entry.url).hostname : undefined,
+    }));
+
+    return { results };
+  } catch (error) {
+    throw new Error(`百度搜索失败: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
+}
+
 async function runKimiSearch(params: {
   query: string;
   apiKey: string;
@@ -1042,15 +1051,17 @@ async function runWebSearch(params: {
   kimiModel?: string;
 }): Promise<Record<string, unknown>> {
   const cacheKey = normalizeCacheKey(
-    params.provider === "brave"
-      ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}`
-      : params.provider === "perplexity"
-        ? `${params.provider}:${params.query}:${params.perplexityBaseUrl ?? DEFAULT_PERPLEXITY_BASE_URL}:${params.perplexityModel ?? DEFAULT_PERPLEXITY_MODEL}:${params.freshness || "default"}`
-        : params.provider === "kimi"
-          ? `${params.provider}:${params.query}:${params.kimiBaseUrl ?? DEFAULT_KIMI_BASE_URL}:${params.kimiModel ?? DEFAULT_KIMI_MODEL}`
-          : params.provider === "gemini"
-            ? `${params.provider}:${params.query}:${params.geminiModel ?? DEFAULT_GEMINI_MODEL}`
-            : `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`,
+    params.provider === "baidu"
+      ? `${params.provider}:${params.query}:${params.count}`
+      : params.provider === "brave"
+        ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}`
+        : params.provider === "perplexity"
+          ? `${params.provider}:${params.query}:${params.perplexityBaseUrl ?? DEFAULT_PERPLEXITY_BASE_URL}:${params.perplexityModel ?? DEFAULT_PERPLEXITY_MODEL}:${params.freshness || "default"}`
+          : params.provider === "kimi"
+            ? `${params.provider}:${params.query}:${params.kimiBaseUrl ?? DEFAULT_KIMI_BASE_URL}:${params.kimiModel ?? DEFAULT_KIMI_MODEL}`
+            : params.provider === "gemini"
+              ? `${params.provider}:${params.query}:${params.geminiModel ?? DEFAULT_GEMINI_MODEL}`
+              : `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`,
   );
   const cached = readCache(SEARCH_CACHE, cacheKey);
   if (cached) {
@@ -1058,6 +1069,35 @@ async function runWebSearch(params: {
   }
 
   const start = Date.now();
+
+  if (params.provider === "baidu") {
+    const { results } = await runBaiduSearch({
+      query: params.query,
+      count: params.count,
+      timeoutSeconds: params.timeoutSeconds,
+    });
+
+    const payload = {
+      query: params.query,
+      provider: params.provider,
+      count: results.length,
+      tookMs: Date.now() - start,
+      externalContent: {
+        untrusted: true,
+        source: "web_search",
+        provider: params.provider,
+        wrapped: true,
+      },
+      results: results.map((r) => ({
+        title: wrapWebContent(r.title, "web_search"),
+        url: r.url,
+        description: wrapWebContent(r.description, "web_search"),
+        siteName: r.siteName,
+      })),
+    };
+    writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+    return payload;
+  }
 
   if (params.provider === "perplexity") {
     const { content, citations } = await runPerplexitySearch({
@@ -1260,7 +1300,9 @@ export function createWebSearchTool(options?: {
           ? "Search the web using Kimi by Moonshot. Returns AI-synthesized answers with citations from native $web_search."
           : provider === "gemini"
             ? "Search the web using Gemini with Google Search grounding. Returns AI-synthesized answers with citations from Google Search."
-            : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
+            : provider === "baidu"
+              ? "Search the web using Baidu Search. Returns titles, URLs, and snippets for fast research. No API key required."
+              : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
 
   return {
     label: "Web Search",
@@ -1279,9 +1321,11 @@ export function createWebSearchTool(options?: {
               ? resolveKimiApiKey(kimiConfig)
               : provider === "gemini"
                 ? resolveGeminiApiKey(geminiConfig)
-                : resolveSearchApiKey(search);
+                : provider === "baidu"
+                  ? undefined
+                  : resolveSearchApiKey(search);
 
-      if (!apiKey) {
+      if (!apiKey && provider !== "baidu") {
         return jsonResult(missingSearchKeyPayload(provider));
       }
       const params = args as Record<string, unknown>;
@@ -1292,7 +1336,12 @@ export function createWebSearchTool(options?: {
       const search_lang = readStringParam(params, "search_lang");
       const ui_lang = readStringParam(params, "ui_lang");
       const rawFreshness = readStringParam(params, "freshness");
-      if (rawFreshness && provider !== "brave" && provider !== "perplexity") {
+      if (
+        rawFreshness &&
+        provider !== "brave" &&
+        provider !== "perplexity" &&
+        provider !== "baidu"
+      ) {
         return jsonResult({
           error: "unsupported_freshness",
           message: "freshness is only supported by the Brave and Perplexity web_search providers.",
